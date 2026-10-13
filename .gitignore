@@ -1,0 +1,9 @@
+build/
+dist/
+tests/artifacts/
+github-upload/
+.vs/
+*.log
+*.backup-*
+*.user
+*.suo

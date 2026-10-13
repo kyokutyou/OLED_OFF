@@ -1,0 +1,3 @@
+#include "resource.h"
+IDI_OLED_OFF ICON "native/assets/oled-off.ico"
+IDR_SHORTCUT_ICON RCDATA "native/assets/oled-off.ico"
