@@ -4,6 +4,8 @@
 
 既定のキーは **Ctrl+Shift+F12**。好きなキーに変更できます。PCのスリープやロックは行いません。
 
+[OLED_OFFの紹介ページ](https://kyokutyou.com/oled-off.html)
+
 ![設定画面](docs/images/setup.png)
 
 ## ダウンロード
