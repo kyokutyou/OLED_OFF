@@ -45,20 +45,58 @@ void VerifyLink(const std::wstring& path, const std::wstring& executable, WORD e
 
 DWORD delayValue = 0;
 bool mockSuccess = true;
+int dispatchCount = 0;
+HWND dispatchedWindow = nullptr;
 void WINAPI MockDelay(DWORD milliseconds) { delayValue = milliseconds; }
-LRESULT WINAPI MockSend(HWND window, UINT message, WPARAM w, LPARAM l, UINT flags, UINT timeout, PDWORD_PTR result) {
-    Require(window == HWND_BROADCAST && message == WM_SYSCOMMAND && w == SC_MONITORPOWER && l == 2 &&
-        flags == SMTO_ABORTIFHUNG && timeout == 2000 && result != nullptr, L"Monitor command differs.");
-    *result = 0;
-    return mockSuccess ? 1 : 0;
+bool MockNewProcessAge(ULONGLONG& milliseconds) { milliseconds = 0; return true; }
+LRESULT WINAPI MockDispatch(HWND window, UINT message, WPARAM w, LPARAM l) {
+    Require(window != HWND_BROADCAST, L"Monitor requests must not be left in other applications' message queues.");
+    DWORD process = 0;
+    Require(GetWindowThreadProcessId(window, &process) == GetCurrentThreadId() && process == GetCurrentProcessId(),
+        L"Monitor request must execute on the calling process and thread.");
+    Require(!IsWindowVisible(window) && message == WM_SYSCOMMAND && w == SC_MONITORPOWER && l == 2,
+        L"Monitor command differs.");
+    ++dispatchCount;
+    dispatchedWindow = window;
+    return mockSuccess ? 0 : 1;
 }
 
 int simulatedWinKey = VK_LWIN;
 SHORT WINAPI MockHeldWin(int key) {
-    return key == VK_CONTROL || key == simulatedWinKey ? static_cast<SHORT>(0x8000) : 0;
+    return key == VK_LCONTROL || key == simulatedWinKey ? static_cast<SHORT>(0x8000) : 0;
+}
+
+std::vector<int> simulatedHeldModifiers;
+SHORT WINAPI MockHeldModifiers(int key) {
+    return std::find(simulatedHeldModifiers.begin(), simulatedHeldModifiers.end(), key) !=
+        simulatedHeldModifiers.end() ? static_cast<SHORT>(0x8000) : 0;
 }
 
 void VerifyKeyCapture() {
+    // Releasing one side must not discard the other side of the same modifier.
+    for (const auto& modifier : {std::pair<UINT, UINT>{VK_LCONTROL, VK_RCONTROL},
+                                std::pair<UINT, UINT>{VK_LMENU, VK_RMENU},
+                                std::pair<UINT, UINT>{VK_LSHIFT, VK_RSHIFT}}) {
+        for (bool releaseLeft : {false, true}) {
+            UI::State chord;
+            chord.beforeCapture = chord.selected;
+            chord.recording = true;
+            if (modifier.first == VK_LSHIFT) UI::RecordKey(chord, VK_LCONTROL, true);
+            UI::RecordKey(chord, modifier.first, true);
+            UI::RecordKey(chord, modifier.second, true);
+            UI::RecordKey(chord, releaseLeft ? modifier.first : modifier.second, false);
+            UI::RecordKey(chord, VK_F10, true);
+            UI::RecordKey(chord, VK_F10, false);
+            Require(chord.recording, L"Capture ended while the other modifier was still held.");
+            UI::RecordKey(chord, releaseLeft ? modifier.second : modifier.first, false);
+            if (modifier.first == VK_LSHIFT) UI::RecordKey(chord, VK_LCONTROL, false);
+            WORD expected = modifier.first == VK_LCONTROL ? MAKEWORD(VK_F10, HOTKEYF_CONTROL) :
+                modifier.first == VK_LMENU ? MAKEWORD(VK_F10, HOTKEYF_ALT) :
+                MAKEWORD(VK_F10, HOTKEYF_CONTROL | HOTKEYF_SHIFT);
+            Require(!chord.recording && chord.selected == expected,
+                L"A held left/right modifier was dropped from the selected shortcut.");
+        }
+    }
     UI::State state;
     state.beforeCapture = state.selected;
     state.recording = true;
@@ -106,6 +144,61 @@ void VerifyKeyCapture() {
     UI::RecordKey(state, VK_F12, true);
     Require(state.win && state.pending == 0 && state.hasError, L"Second held Win key was ignored.");
     UI::RecordKey(state, VK_ESCAPE, true);
+
+    for (const auto& modifier : {std::pair<UINT, UINT>{VK_LCONTROL, VK_RCONTROL},
+                                std::pair<UINT, UINT>{VK_LMENU, VK_RMENU},
+                                std::pair<UINT, UINT>{VK_LSHIFT, VK_RSHIFT}}) {
+        for (bool releaseLeft : {false, true}) {
+            simulatedHeldModifiers = {static_cast<int>(modifier.first), static_cast<int>(modifier.second)};
+            if (modifier.first == VK_LSHIFT) simulatedHeldModifiers.push_back(VK_LCONTROL);
+            UI::BeginCapture(state, MockHeldModifiers);
+            UI::RecordKey(state, releaseLeft ? modifier.first : modifier.second, false);
+            UI::RecordKey(state, VK_F10, true);
+            UI::RecordKey(state, VK_F10, false);
+            Require(state.recording, L"Pre-held opposite modifier was lost after one side was released.");
+            UI::RecordKey(state, releaseLeft ? modifier.second : modifier.first, false);
+            if (modifier.first == VK_LSHIFT) UI::RecordKey(state, VK_LCONTROL, false);
+            WORD expected = modifier.first == VK_LCONTROL ? MAKEWORD(VK_F10, HOTKEYF_CONTROL) :
+                modifier.first == VK_LMENU ? MAKEWORD(VK_F10, HOTKEYF_ALT) :
+                MAKEWORD(VK_F10, HOTKEYF_CONTROL | HOTKEYF_SHIFT);
+            Require(!state.recording && state.selected == expected && !state.hook && !UI::recordingState,
+                L"A modifier held before capture was dropped or the completed capture leaked a hook.");
+        }
+    }
+
+    const WORD beforeCancel = state.selected;
+    simulatedHeldModifiers = {VK_LCONTROL, VK_RSHIFT};
+    UI::BeginCapture(state, MockHeldModifiers);
+    UI::RecordKey(state, VK_F12, true);
+    UI::RecordKey(state, VK_ESCAPE, true);
+    Require(state.selected == beforeCancel && !state.hook && !UI::recordingState,
+        L"Cancelling a chord changed its saved selection or leaked a hook.");
+    simulatedHeldModifiers.clear();
+    UI::BeginCapture(state, MockHeldModifiers);
+    UI::RecordKey(state, VK_RMENU, true);
+    UI::RecordKey(state, VK_F10, true);
+    UI::RecordKey(state, VK_F10, false);
+    UI::RecordKey(state, VK_RMENU, false);
+    Require(!state.recording && state.selected == MAKEWORD(VK_F10, HOTKEYF_ALT),
+        L"A cancelled capture left modifiers in the next capture.");
+
+    // Generic virtual-key events remain accepted by the recording interface.
+    for (UINT modifier : {VK_CONTROL, VK_MENU, VK_SHIFT}) {
+        UI::State generic;
+        generic.beforeCapture = generic.selected;
+        generic.recording = true;
+        if (modifier == VK_SHIFT) UI::RecordKey(generic, VK_CONTROL, true);
+        UI::RecordKey(generic, modifier, true);
+        UI::RecordKey(generic, VK_F10, true);
+        UI::RecordKey(generic, VK_F10, false);
+        UI::RecordKey(generic, modifier, false);
+        if (modifier == VK_SHIFT) UI::RecordKey(generic, VK_CONTROL, false);
+        WORD expected = modifier == VK_CONTROL ? MAKEWORD(VK_F10, HOTKEYF_CONTROL) :
+            modifier == VK_MENU ? MAKEWORD(VK_F10, HOTKEYF_ALT) :
+            MAKEWORD(VK_F10, HOTKEYF_CONTROL | HOTKEYF_SHIFT);
+        Require(!generic.recording && generic.selected == expected,
+            L"Generic modifier virtual-key events were not accepted.");
+    }
 }
 
 void VerifyIcon() {
@@ -255,7 +348,78 @@ void VerifyUI(const std::wstring& folder, const std::wstring& executable) {
     std::wcout << L"UI previews: " << folder << L"\n";
 }
 
-int wmain() {
+// Only the test executable exposes this mode. The injected dispatcher never
+// forwards a system command, so process-lifetime tests cannot switch a display.
+std::wstring lifecycleLog;
+DWORD lifecycleDispatchDelay = 0, lifecycleStartDelay = 500;
+HWND lifecycleWindow = nullptr;
+
+void LifecycleEvent(const char* event) {
+    std::ofstream stream(lifecycleLog, std::ios::app);
+    Require(stream.good(), L"Cannot open lifecycle test log.");
+    stream << event << '\n';
+    stream.flush();
+    Require(stream.good(), L"Cannot write lifecycle test log.");
+}
+
+void WINAPI LifecycleDelay(DWORD milliseconds) {
+    Require(milliseconds == 500, L"Lifecycle request delay differs.");
+    Sleep(lifecycleStartDelay);
+}
+
+LRESULT WINAPI LifecycleDispatch(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    Require(message == WM_SYSCOMMAND && wParam == SC_MONITORPOWER && lParam == 2 &&
+        IsWindow(window) && GetWindowThreadProcessId(window, nullptr) == GetCurrentThreadId(),
+        L"Lifecycle request escaped its local window/thread.");
+    lifecycleWindow = window;
+    LifecycleEvent("dispatch-start");
+    Sleep(lifecycleDispatchDelay);
+    LifecycleEvent("dispatch-end");
+    return 0;
+}
+
+int MonitorLifecycleChild(const std::wstring& mode, const wchar_t* path, const wchar_t* mutexName) {
+    if (mode != L"normal" && mode != L"hold" && mode != L"stale" && mode != L"late-start" &&
+        mode != L"delayed-overlap" && mode != L"blocked") return 2;
+    lifecycleLog = path;
+    lifecycleDispatchDelay = mode == L"hold" ? 1800 : mode == L"blocked" ? 10000 : 0;
+    lifecycleStartDelay = mode == L"stale" ? 1600 : 500;
+    try {
+        LifecycleEvent("child-start");
+        if (mode == L"late-start") Sleep(1600);
+        if (mode == L"delayed-overlap") Sleep(750);
+        int result = TurnOffMonitor(LifecycleDispatch, LifecycleDelay, mutexName);
+        LifecycleEvent(lifecycleWindow ? IsWindow(lifecycleWindow) ? "window-alive" : "window-destroyed" : "window-none");
+        LifecycleEvent(result == 0 ? "completed-ok" : "completed-error");
+        return result;
+    } catch (const Failure& error) {
+        std::wcerr << error.message << L"\n";
+        return 1;
+    }
+}
+
+int wmain(int count, wchar_t** arguments) {
+    if (count != 1) {
+        if (count >= 2 && std::wstring(arguments[1]) == L"--off") {
+            wchar_t output[32768]{};
+            DWORD length = GetEnvironmentVariableW(L"OLED_OFF_TEST_LOG", output, ARRAYSIZE(output));
+            if (!length || length >= ARRAYSIZE(output)) return 2;
+            lifecycleLog = output;
+            auto testMutex = L"Local\\OLED_OFF.LauncherTest." + lifecycleLog;
+            // Backslashes are not valid inside a named kernel object's name.
+            for (auto& character : testMutex) if (character == L'\\' || character == L'/') character = L'_';
+            testMutex = L"Local\\" + testMutex;
+            try {
+                LifecycleEvent("helper-start");
+                int result = RunOffCommand(count, arguments, LifecycleDispatch, testMutex.c_str());
+                LifecycleEvent(result == 0 ? "completed-ok" : "completed-error");
+                return result;
+            } catch (...) { return 1; }
+        }
+        if (count == 5 && std::wstring(arguments[1]) == L"--monitor-lifecycle")
+            return MonitorLifecycleChild(arguments[2], arguments[3], arguments[4]);
+        return 2;
+    }
     HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(initialized)) return 1;
     int exitCode = 0;
@@ -337,9 +501,14 @@ int wmain() {
         RepairShortcut(shortcut, executable, iconDirectory);
         VerifyLink(shortcut, executable, f10);
         std::wcout << L"PASS: artwork-specific icon path, shell ICO extraction, missing/corrupt icon repair, and old-icon update preserving hotkey.\n";
-        Require(TurnOffMonitor(MockSend, MockDelay) == 0 && delayValue == 500, L"Successful monitor request differs.");
+        auto testMutex = L"Local\\OLED_OFF.Unit." + std::to_wstring(GetCurrentProcessId()) + L"." +
+            std::to_wstring(MonitorClock::Now());
+        Require(TurnOffMonitor(MockDispatch, MockDelay, testMutex.c_str(), MockNewProcessAge) == 0 && delayValue == 500 &&
+            dispatchCount == 1 && !IsWindow(dispatchedWindow), L"Successful monitor request differs or its window remained.");
         mockSuccess = false;
-        Require(TurnOffMonitor(MockSend, MockDelay) == 1, L"Failed monitor request exit code differs.");
+        auto failedMutex = testMutex + L".failure";
+        Require(TurnOffMonitor(MockDispatch, MockDelay, failedMutex.c_str(), MockNewProcessAge) == 1 && dispatchCount == 2 &&
+            !IsWindow(dispatchedWindow), L"Failed monitor request exit code differs or it retried.");
         std::wcout << L"PASS: native key capture, F12/F10/custom shortcut save and update, invalid input, overwrite protection, legacy migration, monitor command and exit codes.\n";
         std::wcout << L"Monitor-off API was substituted; desktop shortcuts were not changed.\n";
     } catch (const Failure& error) {

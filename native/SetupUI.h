@@ -23,6 +23,8 @@ struct State {
     int dpi = 96;
     WORD selected = DefaultKey, saved = 0, pending = 0, beforeCapture = 0;
     bool recording = false, ctrl = false, alt = false, shift = false, win = false;
+    bool leftCtrl = false, rightCtrl = false, leftAlt = false, rightAlt = false;
+    bool leftShift = false, rightShift = false;
     bool leftWin = false, rightWin = false;
     bool complete = false, hasError = false, blocked = false, needsMigration = false;
     std::wstring feedback, destination, executable, iconDirectory;
@@ -77,6 +79,9 @@ void EndCapture(State& state, bool accept) {
     else state.selected = state.beforeCapture;
     state.recording = false;
     state.pending = 0;
+    state.ctrl = state.alt = state.shift = state.win = false;
+    state.leftCtrl = state.rightCtrl = state.leftAlt = state.rightAlt = false;
+    state.leftShift = state.rightShift = state.leftWin = state.rightWin = false;
     state.hasError = false;
     state.feedback.clear();
     if (state.hook) { UnhookWindowsHookEx(state.hook); state.hook = nullptr; }
@@ -90,9 +95,18 @@ void RecordKey(State& state, UINT code, bool down) {
     if (!state.recording) return;
     if (down && code == VK_ESCAPE) { EndCapture(state, false); return; }
     switch (code) {
-    case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: state.ctrl = down; break;
-    case VK_MENU: case VK_LMENU: case VK_RMENU: state.alt = down; break;
-    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: state.shift = down; break;
+    case VK_CONTROL: case VK_LCONTROL:
+        state.leftCtrl = down; state.ctrl = state.leftCtrl || state.rightCtrl; break;
+    case VK_RCONTROL:
+        state.rightCtrl = down; state.ctrl = state.leftCtrl || state.rightCtrl; break;
+    case VK_MENU: case VK_LMENU:
+        state.leftAlt = down; state.alt = state.leftAlt || state.rightAlt; break;
+    case VK_RMENU:
+        state.rightAlt = down; state.alt = state.leftAlt || state.rightAlt; break;
+    case VK_SHIFT: case VK_LSHIFT:
+        state.leftShift = down; state.shift = state.leftShift || state.rightShift; break;
+    case VK_RSHIFT:
+        state.rightShift = down; state.shift = state.leftShift || state.rightShift; break;
     case VK_LWIN: case VK_RWIN:
         if (code == VK_LWIN) state.leftWin = down; else state.rightWin = down;
         state.win = state.leftWin || state.rightWin;
@@ -146,9 +160,15 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM message, LPARAM data) {
 void BeginCapture(State& state, decltype(&GetAsyncKeyState) readKey = &GetAsyncKeyState) {
     state.beforeCapture = state.selected;
     state.pending = 0;
-    state.ctrl = (readKey(VK_CONTROL) & 0x8000) != 0;
-    state.alt = (readKey(VK_MENU) & 0x8000) != 0;
-    state.shift = (readKey(VK_SHIFT) & 0x8000) != 0;
+    state.leftCtrl = (readKey(VK_LCONTROL) & 0x8000) != 0;
+    state.rightCtrl = (readKey(VK_RCONTROL) & 0x8000) != 0;
+    state.leftAlt = (readKey(VK_LMENU) & 0x8000) != 0;
+    state.rightAlt = (readKey(VK_RMENU) & 0x8000) != 0;
+    state.leftShift = (readKey(VK_LSHIFT) & 0x8000) != 0;
+    state.rightShift = (readKey(VK_RSHIFT) & 0x8000) != 0;
+    state.ctrl = state.leftCtrl || state.rightCtrl;
+    state.alt = state.leftAlt || state.rightAlt;
+    state.shift = state.leftShift || state.rightShift;
     state.leftWin = (readKey(VK_LWIN) & 0x8000) != 0;
     state.rightWin = (readKey(VK_RWIN) & 0x8000) != 0;
     state.win = state.leftWin || state.rightWin;
