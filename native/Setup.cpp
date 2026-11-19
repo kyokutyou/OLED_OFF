@@ -10,7 +10,10 @@
 #include <cstdint>
 #include <fstream>
 #include <iterator>
+#include <cerrno>
 #include "resource.h"
+#include "MonitorClock.h"
+#include "MonitorRequest.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -185,13 +188,156 @@ void RepairShortcut(const std::wstring& destination, const std::wstring& executa
     SaveShortcut(destination, executable, key, iconDirectory);
 }
 
-int TurnOffMonitor(decltype(&SendMessageTimeoutW) send = &SendMessageTimeoutW,
-                   decltype(&Sleep) delay = &Sleep) {
+constexpr const wchar_t* MonitorOffMutexName = MonitorRequest::MutexName;
+constexpr ULONGLONG MonitorOffExpiry = 1500;
+constexpr DWORD MonitorOffTimeout = 3000;
+
+bool MonitorOffProcessAge(ULONGLONG& milliseconds) {
+    MonitorClock::Creation creation;
+    if (!MonitorClock::ReadCreation(GetCurrentProcess(), creation)) return false;
+    auto now = MonitorClock::Now();
+    if (now < creation.interruptTime) return false;
+    milliseconds = (now - creation.interruptTime) / MonitorClock::TicksPerMillisecond;
+    return true;
+}
+
+// The watchdog belongs to this one-shot process. It never retries or starts a
+// helper process. A blocked power call must not leave an application running.
+struct MonitorOffDeadline {
+    ULONGLONG started;
+    HANDLE stop = nullptr, thread = nullptr;
+    explicit MonitorOffDeadline(ULONGLONG start) : started(start) {
+        stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (stop) thread = CreateThread(nullptr, 0, Watch, this, 0, nullptr);
+    }
+    static DWORD WINAPI Watch(void* parameter) {
+        auto& deadline = *static_cast<MonitorOffDeadline*>(parameter);
+        for (;;) {
+            auto now = MonitorClock::Now();
+            auto elapsed = now >= deadline.started ? now - deadline.started : ~0ULL;
+            if (elapsed >= MonitorOffTimeout * MonitorClock::TicksPerMillisecond)
+                TerminateProcess(GetCurrentProcess(), 1);
+            // Recheck the biased clock after resume; a relative Windows wait
+            // alone does not include time spent in system sleep.
+            DWORD status = WaitForSingleObject(deadline.stop, 25);
+            if (status == WAIT_OBJECT_0) return 0;
+            if (status != WAIT_TIMEOUT) { TerminateProcess(GetCurrentProcess(), 1); return 1; }
+        }
+    }
+    ~MonitorOffDeadline() {
+        if (thread) {
+            SetEvent(stop);
+            WaitForSingleObject(thread, INFINITE);
+            CloseHandle(thread);
+        }
+        if (stop) CloseHandle(stop);
+    }
+};
+
+std::wstring MonitorOffStatePath(const wchar_t* mutexName, const MonitorRequest::Identity& identity) {
+    std::wstring path;
+    if (std::wstring(mutexName) == MonitorOffMutexName) {
+        if (!MonitorRequest::DefaultStatePath(identity, path)) return {};
+    } else {
+        // Explicit non-production coordination names are used by isolated test
+        // processes. Their files stay beside the test executable.
+        std::uint64_t hash = 14695981039346656037ULL;
+        for (const wchar_t* part = mutexName; *part; ++part) { hash ^= *part; hash *= 1099511628211ULL; }
+        path = ParentFolder(ExecutablePath()) + L"\\request-state-" + std::to_wstring(hash) + L".bin";
+    }
+    return path;
+}
+
+struct MonitorOffWindow {
+    HWND handle = nullptr;
+    ~MonitorOffWindow() { if (handle) DestroyWindow(handle); }
+};
+
+int ExecuteMonitorOff(ULONGLONG started, HANDLE origin,
+                      decltype(&DefWindowProcW) dispatch, decltype(&Sleep) delay,
+                      const wchar_t* mutexName) {
+    auto fresh = [&]() {
+        auto now = MonitorClock::Now();
+        return now >= started && now - started < MonitorOffExpiry * MonitorClock::TicksPerMillisecond &&
+            WaitForSingleObject(origin, 0) == WAIT_TIMEOUT;
+    };
+    if (!fresh()) return 0;
+    MonitorOffDeadline deadline(started);
+    if (!deadline.thread) return 1;
+    MonitorRequest::Identity identity;
+    if (!MonitorRequest::CurrentIdentity(identity)) return 1;
+    auto statePath = MonitorOffStatePath(mutexName, identity);
+    if (statePath.empty()) return 1;
+    MonitorRequest::Coordinator coordinator(mutexName, statePath, identity);
+    auto decision = coordinator.Begin(started, MonitorClock::Now());
+    if (decision != MonitorRequest::Decision::Accepted)
+        return decision == MonitorRequest::Decision::Dropped ? 0 : 1;
     delay(500);
-    DWORD_PTR result = 0;
-    SetLastError(0);
-    return send(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2,
-        SMTO_ABORTIFHUNG, 2000, &result) ? 0 : 1;
+    if (!fresh()) return 0;
+
+    // Process the system command synchronously on our own thread/window. No
+    // other application's message queue can retain a request after we exit.
+    MonitorOffWindow window;
+    window.handle = CreateWindowExW(0, L"STATIC", L"OLED_OFF power request", WS_POPUP,
+        0, 0, 0, 0, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!window.handle) return 1;
+    if (!fresh()) return 0;
+    LRESULT result = dispatch(window.handle, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+    bool completed = coordinator.Complete(MonitorClock::Now());
+    // WM_SYSCOMMAND returns zero when handled; this is not a physical display
+    // state measurement. There is deliberately no retry on an error.
+    return result == 0 && completed ? 0 : 1;
+}
+
+int TurnOffMonitor(decltype(&DefWindowProcW) dispatch = &DefWindowProcW,
+                   decltype(&Sleep) delay = &Sleep,
+                   const wchar_t* mutexName = MonitorOffMutexName,
+                   decltype(&MonitorOffProcessAge) readAge = &MonitorOffProcessAge) {
+    ULONGLONG started = 0;
+    if (readAge == &MonitorOffProcessAge) {
+        MonitorClock::Creation creation;
+        if (!MonitorClock::ReadCreation(GetCurrentProcess(), creation)) return 1;
+        started = creation.interruptTime;
+    } else {
+        // A deterministic request-age seam for unit tests; CLI paths always
+        // use OS process metadata directly and never round creation time.
+        const auto sampled = MonitorClock::Now();
+        ULONGLONG age = 0;
+        if (!readAge(age)) return 1;
+        if (age >= MonitorOffExpiry || age * MonitorClock::TicksPerMillisecond > sampled) return 0;
+        started = sampled - age * MonitorClock::TicksPerMillisecond;
+    }
+    return ExecuteMonitorOff(started, GetCurrentProcess(), dispatch, delay, mutexName);
+}
+
+bool MonitorOffUnsigned(const wchar_t* text, ULONGLONG& value) {
+    if (!text || !*text) return false;
+    for (const wchar_t* part = text; *part; ++part) if (*part < L'0' || *part > L'9') return false;
+    errno = 0;
+    wchar_t* end = nullptr;
+    value = wcstoull(text, &end, 10);
+    return errno != ERANGE && end && *end == 0;
+}
+
+int RunOffCommand(int count, wchar_t** arguments,
+                  decltype(&DefWindowProcW) dispatch = &DefWindowProcW,
+                  const wchar_t* mutexName = MonitorOffMutexName) {
+    if (count == 2 && std::wstring(arguments[1]) == L"--off") return TurnOffMonitor(dispatch, &Sleep, mutexName);
+    if (count != 6 || std::wstring(arguments[1]) != L"--off" ||
+        std::wstring(arguments[2]) != L"--request-process" || std::wstring(arguments[4]) != L"--request-created") return 1;
+    ULONGLONG processId = 0, expectedCreation = 0;
+    if (!MonitorOffUnsigned(arguments[3], processId) || !processId || processId > MAXDWORD ||
+        !MonitorOffUnsigned(arguments[5], expectedCreation) || !expectedCreation) return 1;
+    HANDLE origin = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, static_cast<DWORD>(processId));
+    if (!origin) return 1;
+    int result = 1;
+    try {
+        MonitorClock::Creation creation;
+        if (MonitorClock::ReadCreation(origin, creation) && creation.fileTime == expectedCreation)
+            result = ExecuteMonitorOff(creation.interruptTime, origin, dispatch, &Sleep, mutexName);
+    } catch (...) { CloseHandle(origin); throw; }
+    CloseHandle(origin);
+    return result;
 }
 
 #include "SetupUI.h"
@@ -201,11 +347,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     int count = 0;
     PWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &count);
     if (!arguments) return 1;
-    bool off = count == 2 && std::wstring(arguments[1]) == L"--off";
+    bool off = count >= 2 && std::wstring(arguments[1]) == L"--off";
     bool setup = count == 1;
     bool repair = count == 2 && std::wstring(arguments[1]) == L"--repair-shortcut";
+    if (off) {
+        int result = 1;
+        try { result = RunOffCommand(count, arguments); } catch (...) { result = 1; }
+        LocalFree(arguments);
+        return result;
+    }
     LocalFree(arguments);
-    if (off) return TurnOffMonitor();
     if (!setup && !repair) return 1;
     HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(initialized)) return 1;
